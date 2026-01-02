@@ -28,8 +28,9 @@ export default function App() {
   const [minimized, setMinimized] = useState(false);
   const [playbackLoading, setPlaybackLoading] = useState(false);
 
-  // Settings
+  // Settings & EULA State
   const [showSettings, setShowSettings] = useState(false);
+  const [showEula, setShowEula] = useState(false);
   const [config, setConfig] = useState(getConfig());
   const [scanResults, setScanResults] = useState([]);
   const [activeSettingInput, setActiveSettingInput] = useState(null);
@@ -65,7 +66,14 @@ export default function App() {
   };
 
   useEffect(() => {
-      setConfig(getConfig());
+      // 1. Check EULA on startup
+      const currentConfig = getConfig();
+      setConfig(currentConfig);
+      
+      if (!currentConfig.TERMS_ACCEPTED) {
+          setShowEula(true);
+      }
+
       if (cache[activeTab]) setItems(cache[activeTab]);
       loadMainTab(activeTab);
 
@@ -86,6 +94,21 @@ export default function App() {
       return () => { clearInterval(dataInterval); clearInterval(playerInterval); };
   }, [activeTab]);
 
+  // --- EULA HANDLERS ---
+  const handleEulaAccept = () => {
+      const newConfig = { ...config, TERMS_ACCEPTED: true };
+      saveConfig(newConfig);
+      setConfig(newConfig);
+      setShowEula(false);
+  };
+
+  const handleEulaDecline = () => {
+      if(confirm("You must accept the terms to use this device. The application will now close.")) {
+          window.close(); 
+      }
+  };
+
+  // --- CONFIG HANDLERS ---
   const handleConfigChange = (field, value) => { setConfig(prev => ({ ...prev, [field]: value })); };
   const handleDeviceSelect = (deviceId) => { handleConfigChange('ANDROID_TV_ID', deviceId); setScanResults([]); };
   const handleSettingsFocus = (field) => { setActiveSettingInput(field); setShowKeyboard(true); if (keyboard.current) keyboard.current.setInput(config[field]); };
@@ -93,13 +116,6 @@ export default function App() {
   
   const handleScan = async () => { saveConfig(config); try { setScanResults(await scanDevices()); } catch(e) { alert(e.message); } };
   const handleSaveSettings = () => { saveConfig(config); setShowSettings(false); alert("Settings Saved! Reloading..."); setCache({ movies: [], series: [], livetv: [] }); loadMainTab(activeTab); };
-
-  // --- NEW: QUIT APPLICATION ---
-  const handleQuit = () => {
-      if (confirm("Are you sure you want to quit the Kiosk?")) {
-          window.close(); // Standard way to close Electron/Browser windows
-      }
-  };
 
   const refreshLibraryMerge = async (tab) => {
       const isMovie = tab === 'movies';
@@ -138,6 +154,7 @@ export default function App() {
   const handleItemClick = async (item) => {
     if (item.status && item.status !== 'AVAILABLE') return; 
 
+    // CATCH-ALL: Play unless it's a folder structure
     const isContainer = ['Series', 'Season', 'BoxSet', 'Folder', 'Collection'].includes(item.Type);
 
     if (isContainer) {
@@ -296,7 +313,14 @@ export default function App() {
                 <div className="settings-content" style={{overflowY: 'auto'}}>
                     <button className="close-settings" onClick={() => setShowSettings(false)}>×</button>
                     <div className="settings-title">Settings</div>
-                    {/* (Existing Inputs for URLs/Keys...) */}
+                    {/* INPUTS HERE (Same as previous step) */}
+                    <div className="input-group">
+                        <label className="input-label">Appearance</label>
+                        <div className="device-scan-row">
+                            <button className="scan-btn" style={{flex: 1, backgroundColor: config.ACCENT_COLOR}} onClick={() => alert("Themes available in index.css")}>Theme: {config.ACCENT_COLOR}</button>
+                        </div>
+                    </div>
+                    <hr style={{width: '100%', borderColor: '#333', margin: '10px 0'}} />
                     <div className="input-group">
                         <label className="input-label">Jellyfin URL</label>
                         <input className="settings-input" value={config.JELLYFIN_URL} onFocus={() => handleSettingsFocus('JELLYFIN_URL')} onChange={e => handleConfigChange('JELLYFIN_URL', e.target.value)} />
@@ -331,10 +355,39 @@ export default function App() {
                         <label className="input-label">Jellyseerr API Key</label>
                         <input className="settings-input" value={config.JELLYSEER_API_KEY} onFocus={() => handleSettingsFocus('JELLYSEER_API_KEY')} onChange={e => handleConfigChange('JELLYSEER_API_KEY', e.target.value)} />
                     </div>
-
                     <div className="settings-actions">
-                        <button className="btn-cancel" style={{borderColor: 'red', color: 'red'}} onClick={handleQuit}>Quit App</button>
                         <button className="save-btn" onClick={handleSaveSettings}>Save</button>
+                    </div>
+                </div>
+            </div>
+        )}
+
+        {/* --- EULA MODAL (MANDATORY STARTUP) --- */}
+        {showEula && (
+            <div className="modal-overlay" style={{zIndex: 9999, backgroundColor: 'black'}}>
+                <div className="settings-content" style={{maxWidth: '800px', height: '90vh', display: 'flex', flexDirection: 'column'}}>
+                    <div className="settings-title" style={{color: 'var(--accent)', textAlign: 'center'}}>END USER LICENSE AGREEMENT</div>
+                    
+                    <div className="eula-text" style={{flex: 1, overflowY: 'auto', background: '#111', padding: '25px', border: '1px solid #333', borderRadius: '8px', marginBottom: '20px', color: '#ccc', lineHeight: '1.6', fontSize: '0.95rem', textAlign: 'left'}}>
+                        <h3 style={{color: 'white', marginTop: 0}}>1. ACCEPTANCE OF TERMS</h3>
+                        <p>By installing, copying, or otherwise using the KloudIT Kiosk software ("Software"), you agree to be bound by the terms of this End User License Agreement ("EULA"). If you do not agree to the terms of this EULA, do not install or use the Software.</p>
+                        
+                        <h3 style={{color: 'white'}}>2. LICENSE GRANT</h3>
+                        <p>KloudIT grants you a revocable, non-exclusive, non-transferable, limited license to download, install and use the Software strictly in accordance with the terms of this Agreement.</p>
+                        
+                        <h3 style={{color: 'white'}}>3. DISCLAIMER OF WARRANTIES</h3>
+                        <p style={{textTransform: 'uppercase'}}>THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.</p>
+                        
+                        <h3 style={{color: 'white'}}>4. LIMITATION OF LIABILITY</h3>
+                        <p>In no event shall KloudIT be liable for any special, incidental, indirect, or consequential damages whatsoever (including, but not limited to, damages for loss of profits, loss of data or other information, for business interruption, for personal injury, for loss of privacy arising out of or in any way related to the use of or inability to use the Software).</p>
+
+                        <h3 style={{color: 'white'}}>5. THIRD PARTY SERVICES</h3>
+                        <p>This Software interacts with third-party services (e.g., Jellyfin, Jellyseerr). KloudIT is not responsible for the availability, content, or accuracy of such services.</p>
+                    </div>
+
+                    <div className="settings-actions" style={{justifyContent: 'space-between', padding: '0 20px'}}>
+                        <button className="btn-cancel" style={{borderColor: '#e74c3c', color: '#e74c3c', width: '45%'}} onClick={handleEulaDecline}>Decline & Quit</button>
+                        <button className="save-btn" style={{backgroundColor: '#2ecc71', color: 'black', width: '45%'}} onClick={handleEulaAccept}>I Accept the Terms</button>
                     </div>
                 </div>
             </div>
