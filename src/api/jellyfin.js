@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { getConfig } from '../utils/config';
 
+// Helper to get a fresh client
 const getClient = () => {
     const { JELLYFIN_URL, JELLYFIN_API_KEY } = getConfig();
     return axios.create({
@@ -14,10 +15,12 @@ const getUserId = async () => {
     return res.data[0].Id; 
 }
 
+// --- SCANNER ---
 export const scanDevices = async () => {
     try {
         const { ANDROID_TV_ID } = getConfig();
         const res = await getClient().get('/Sessions');
+        
         return res.data.map(s => ({
             name: s.DeviceName || "Unknown Device",
             id: s.DeviceId,
@@ -26,14 +29,24 @@ export const scanDevices = async () => {
             isControllable: s.SupportsRemoteControl,
             isCurrentTarget: s.DeviceId === ANDROID_TV_ID
         }));
-    } catch (e) { throw new Error("Connection failed. Check URL and API Key."); }
+    } catch (e) {
+        throw new Error("Connection failed. Check URL and API Key.");
+    }
 };
 
+// --- MEDIA FETCHERS ---
 export const getItems = async (type = 'Movie') => {
   try {
     const userId = await getUserId();
     const res = await getClient().get(`/Users/${userId}/Items`, {
-      params: { IncludeItemTypes: type, Recursive: true, SortBy: 'DateCreated', SortOrder: 'Descending', Limit: 100, Fields: 'PrimaryImageAspectRatio' }
+      params: { 
+          IncludeItemTypes: type, 
+          Recursive: true, 
+          SortBy: 'DateCreated', 
+          SortOrder: 'Descending', 
+          Limit: 100, 
+          Fields: 'PrimaryImageAspectRatio,UserData,RunTimeTicks' 
+      }
     });
     return res.data.Items;
   } catch (e) { console.error(e); return []; }
@@ -43,27 +56,29 @@ export const getLiveTvChannels = async () => {
     try {
         const userId = await getUserId();
         const res = await getClient().get('/LiveTv/Channels', {
-            params: { UserId: userId, Limit: 500, Fields: 'PrimaryImageAspectRatio,ChannelNumber', SortBy: 'ChannelNumber,SortName' }
+            params: { UserId: userId, Limit: 2000, Fields: 'PrimaryImageAspectRatio,ChannelNumber', SortBy: 'ChannelNumber,SortName' }
         });
-        const SPORTS_KEYWORDS = ["Ultimate Events", "UFC PPV", "NHL", "NBA", "Premier Sports", "SportsNet", "Boxing PPV", "NFL"];
-        return res.data.Items.filter(c => SPORTS_KEYWORDS.some(k => (c.Name || "").includes(k)));
+        return res.data.Items; 
     } catch (e) { return []; }
 };
 
 export const getSeasons = async (seriesId) => {
     const userId = await getUserId();
-    const res = await getClient().get(`/Shows/${seriesId}/Seasons`, { params: { UserId: userId, Fields: 'PrimaryImageAspectRatio' } });
+    const res = await getClient().get(`/Shows/${seriesId}/Seasons`, { 
+        params: { UserId: userId, Fields: 'PrimaryImageAspectRatio,UserData' } 
+    });
     return res.data.Items;
 };
 
 export const getEpisodes = async (seriesId, seasonId) => {
     const userId = await getUserId();
     const res = await getClient().get(`/Shows/${seriesId}/Episodes`, {
-        params: { UserId: userId, SeasonId: seasonId, Fields: 'PrimaryImageAspectRatio,IndexNumber,Overview' }
+        params: { UserId: userId, SeasonId: seasonId, Fields: 'PrimaryImageAspectRatio,IndexNumber,Overview,UserData,RunTimeTicks' }
     });
     return res.data.Items;
 };
 
+// --- REMOTE CONTROL ---
 const getTargetSession = async () => {
     const { ANDROID_TV_ID } = getConfig();
     const sessions = await getClient().get('/Sessions');
@@ -72,17 +87,32 @@ const getTargetSession = async () => {
     );
 };
 
+// --- UPDATED PLAY LOGIC (AUTO-STOP) ---
 export const playOnDevice = async (itemId) => {
-  if (!itemId) { alert("Error: Item ID is missing."); return; }
+  if (!itemId) return;
   try {
     const session = await getTargetSession();
     if (!session) { alert("Device not found! Go to Settings -> Scan."); return; }
     
-    await getClient().post(`/Sessions/${session.Id}/Playing`, 
+    const client = getClient();
+
+    // 1. If currently playing, STOP it first to clear the buffer
+    if (session.NowPlayingItem) {
+        await client.post(`/Sessions/${session.Id}/Playing/Stop`);
+        // 2. Wait 500ms for the TV to actually stop
+        await new Promise(r => setTimeout(r, 500));
+    }
+
+    // 3. Send Play Command
+    await client.post(`/Sessions/${session.Id}/Playing`, 
       { ItemIds: [String(itemId)], PlayCommand: 'PlayNow' }, 
       { params: { ItemIds: String(itemId), PlayCommand: 'PlayNow' } }
     );
-  } catch (err) { alert("Play Failed: " + err.message); }
+    
+  } catch (err) { 
+      console.error(err);
+      alert("Play Failed: " + err.message); 
+  }
 };
 
 export const getSessionStatus = async () => {
@@ -105,14 +135,13 @@ export const getSessionStatus = async () => {
             seriesName: item.SeriesName || null,
             season: item.ParentIndexNumber || null,
             episode: item.IndexNumber || null,
-            quality: quality,
+            quality: quality, 
             image: item.PrimaryImageTag 
                 ? `${JELLYFIN_URL}/Items/${item.Id}/Images/Primary?tag=${item.PrimaryImageTag}` 
                 : null,
             isPlaying: !session.PlayState.IsPaused,
             positionTicks: session.PlayState.PositionTicks,
-            durationTicks: item.RunTimeTicks,
-            volume: session.PlayState.VolumeLevel
+            durationTicks: item.RunTimeTicks
         };
     } catch (e) { return null; }
 };
