@@ -7,7 +7,6 @@ const getClient = () => {
     
     if (!JELLYSEER_URL || !JELLYSEER_API_KEY) return null;
 
-    // CLEANUP: Remove spaces and trailing slashes
     JELLYSEER_URL = JELLYSEER_URL.trim().replace(/\/$/, ""); 
     JELLYSEER_API_KEY = JELLYSEER_API_KEY.trim();
 
@@ -18,105 +17,90 @@ const getClient = () => {
     });
 };
 
-const formatResults = (results, typeOverride = 'movie') => {
+// SAFE FORMATTER (Filters out broken items)
+const formatResults = (results, typeOverride = null) => {
     if (!Array.isArray(results)) return [];
-    return results.map(item => ({
-        id: item.id,
-        mediaType: typeOverride, 
-        title: item.title || item.name || "Unknown",
-        posterPath: item.posterPath ? `https://image.tmdb.org/t/p/w500${item.posterPath}` : null,
-        status: item.mediaInfo ? item.mediaInfo.status : null,
-        isJellyfin: false
-    }));
-};
-
-// --- IMPROVED DIAGNOSTICS ---
-export const runDiagnostics = async () => {
-    const client = getClient();
-    if (!client) return "Error: Settings missing. Please enter URL & API Key.";
-
-    try {
-        // Step 1: Simple Ping (System Status)
-        // This is the safest endpoint. If this fails, the URL/Key is wrong.
-        const statusRes = await client.get('/status');
-        
-        if (statusRes.status === 200) {
-            // Step 2: Try fetching Content
-            try {
-                const discRes = await client.get('/discover/movies');
-                return `Success! Connected to Jellyseerr v${statusRes.data.version}.\nFound ${discRes.data.results.length} movies.`;
-            } catch (e) {
-                return `Connected to Server, but Discovery failed: ${e.message}`;
-            }
-        }
-    } catch (e) {
-        if (e.response) {
-            if (e.response.status === 401) return "401 Unauthorized: API Key is incorrect.";
-            if (e.response.status === 404) return "404 Not Found: Check URL (should differ from Jellyfin URL).";
-            return `API Error ${e.response.status}: ${e.response.statusText}`;
-        }
-        return `Network Error: ${e.message}. Check IP address.`;
-    }
-    return "Unknown Error.";
-};
-
-const safeGet = async (client, endpoint, fallback = []) => {
-    try {
-        const res = await client.get(endpoint);
-        return res.data.results || fallback;
-    } catch (e) {
-        console.warn(`Fetch Failed [${endpoint}]:`, e.message);
-        return fallback;
-    }
+    return results
+        .filter(item => item && typeof item === 'object') // Filter out nulls
+        .map(item => ({
+            id: item.id,
+            mediaType: typeOverride || item.mediaType || 'movie', 
+            title: item.title || item.name || "Unknown",
+            posterPath: item.posterPath ? `https://image.tmdb.org/t/p/w500${item.posterPath}` : null,
+            status: item.mediaInfo ? item.mediaInfo.status : null,
+            isJellyfin: false
+        }));
 };
 
 export const getDiscovery = async () => {
     const client = getClient();
-    const empty = { trendingMovies: [], trendingSeries: [], popularMixed: [] };
-    if (!client) return empty;
+    
+    // DEFAULT SAFE STRUCTURE
+    const safeResponse = { 
+        popularMixed: [], 
+        trendingMovies: [], 
+        trendingSeries: [] 
+    };
+    
+    if (!client) return safeResponse;
 
     try {
-        // We removed ?sort=trending to use defaults (safer)
-        const [movies, series] = await Promise.all([
-            safeGet(client, '/discover/movies'),
-            safeGet(client, '/discover/tv')
+        const [mixedRes, moviesRes, seriesRes] = await Promise.allSettled([
+            client.get('/discover/trending'), 
+            client.get('/discover/movies'),   
+            client.get('/discover/tv')        
         ]);
 
-        const formattedMovies = formatResults(movies, 'movie');
-        const formattedSeries = formatResults(series, 'tv');
-
-        // Mix them for "Popular"
-        const mixed = [];
-        const maxLength = Math.max(formattedMovies.length, formattedSeries.length);
-        for (let i = 0; i < maxLength; i++) {
-            if (formattedMovies[i]) mixed.push(formattedMovies[i]);
-            if (formattedSeries[i]) mixed.push(formattedSeries[i]);
+        // STRICT CHECKING: Only format if data.results exists
+        if (mixedRes.status === 'fulfilled' && mixedRes.value?.data?.results) {
+            safeResponse.popularMixed = formatResults(mixedRes.value.data.results);
+        }
+        
+        if (moviesRes.status === 'fulfilled' && moviesRes.value?.data?.results) {
+            safeResponse.trendingMovies = formatResults(moviesRes.value.data.results, 'movie');
         }
 
-        return {
-            trendingMovies: formattedMovies,
-            trendingSeries: formattedSeries,
-            popularMixed: mixed.slice(0, 25)
-        };
+        if (seriesRes.status === 'fulfilled' && seriesRes.value?.data?.results) {
+            safeResponse.trendingSeries = formatResults(seriesRes.value.data.results, 'tv');
+        }
+
+        return safeResponse;
+
     } catch (e) {
-        return empty;
+        console.error("Jellyseerr Discovery Error:", e);
+        return safeResponse;
     }
 };
 
+// THIS WAS THE CRASH CAUSE
 export const getRequests = async () => {
     const client = getClient();
     if (!client) return [];
     try {
-        const res = await client.get('/request?take=20&skip=0&sort=added');
-        return res.data.results.map(r => ({
-            id: r.id,
-            mediaId: r.media.tmdbId,
-            title: r.media.title || r.media.name || "Unknown",
-            status: r.media.status === 5 ? 'Available' : r.status === 2 ? 'Approved' : 'Pending',
-            posterPath: r.media.posterPath ? `https://image.tmdb.org/t/p/w500${r.media.posterPath}` : null,
-            isJellyfin: false
-        }));
-    } catch (e) { return []; }
+        const res = await client.get('/request?take=50&skip=0&sort=added');
+        const results = res.data?.results || [];
+        
+        return results
+            .map(r => {
+                // CRITICAL SAFETY CHECK: If r.media is missing, skip this item
+                if (!r || !r.media) return null;
+
+                return {
+                    id: r.id,
+                    mediaId: r.media.tmdbId,
+                    title: r.media.title || r.media.name || "Unknown",
+                    status: r.media.status === 5 ? 'Available' : r.status === 2 ? 'Approved' : 'Pending',
+                    posterPath: r.media.posterPath ? `https://image.tmdb.org/t/p/w500${r.media.posterPath}` : null,
+                    isJellyfin: false,
+                    type: r.type // Ensure type is passed for filtering
+                };
+            })
+            .filter(item => item !== null); // Remove the nulls we just created
+            
+    } catch (e) { 
+        console.error("Get Requests Error:", e);
+        return []; 
+    }
 };
 
 export const searchMedia = async (query) => {
@@ -124,7 +108,7 @@ export const searchMedia = async (query) => {
     if (!client) throw new Error("Jellyseerr not configured.");
     try {
         const res = await client.get(`/search?query=${encodeURIComponent(query)}`);
-        return formatResults(res.data.results, 'movie'); 
+        return formatResults(res.data?.results); 
     } catch (e) {
         throw new Error(e.response ? `API Error ${e.response.status}` : "Network Error");
     }
@@ -138,4 +122,13 @@ export const submitRequest = async (tmdbId, type) => {
     } catch (e) {
         throw new Error("Request failed.");
     }
+};
+
+export const runDiagnostics = async () => {
+    const client = getClient();
+    if (!client) return "Config Missing";
+    try {
+        const res = await client.get('/status');
+        return `Connected! Version: ${res.data?.version}`;
+    } catch(e) { return "Connection Failed: " + e.message; }
 };

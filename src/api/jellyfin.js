@@ -1,168 +1,273 @@
 import axios from 'axios';
 import { getConfig } from '../utils/config';
 
-// Helper to get a fresh client
 const getClient = () => {
     const { JELLYFIN_URL, JELLYFIN_API_KEY } = getConfig();
+    if (!JELLYFIN_URL || !JELLYFIN_API_KEY) return null;
+    
+    // Ensure no double slash at end
+    const cleanUrl = JELLYFIN_URL.endsWith('/') ? JELLYFIN_URL.slice(0, -1) : JELLYFIN_URL;
+    
     return axios.create({
-        baseURL: JELLYFIN_URL,
-        headers: { 'X-Emby-Token': JELLYFIN_API_KEY }
+        baseURL: cleanUrl,
+        headers: { 
+            'X-Emby-Token': JELLYFIN_API_KEY,
+            'X-Emby-Authorization': `MediaBrowser Client="Media Dashboard", Device="Kiosk", DeviceId="kiosk-01", Version="1.0.0"`,
+            'Content-Type': 'application/json'
+        },
+        timeout: 5000
     });
 };
 
 const getUserId = async () => {
-    const res = await getClient().get('/Users');
-    return res.data[0].Id; 
+    const client = getClient();
+    if (!client) return null;
+    try {
+        const res = await client.get('/Users');
+        // Prefer an Admin user to ensure control rights
+        const admin = res.data.find(u => u.Policy && u.Policy.IsAdministrator);
+        return admin ? admin.Id : res.data[0]?.Id; 
+    } catch (e) { return null; }
 }
 
-// --- SCANNER ---
 export const scanDevices = async () => {
+    const client = getClient();
+    if (!client) return [];
     try {
-        const { ANDROID_TV_ID } = getConfig();
-        const res = await getClient().get('/Sessions');
+        const res = await client.get('/Sessions');
+        const targetId = getConfig().ANDROID_TV_ID;
         
-        return res.data.map(s => ({
+        return (res.data || []).map(s => ({
             name: s.DeviceName || "Unknown Device",
             id: s.DeviceId,
             app: s.Client,
             isActive: true,
             isControllable: s.SupportsRemoteControl,
-            isCurrentTarget: s.DeviceId === ANDROID_TV_ID
+            isCurrentTarget: s.DeviceId === targetId
         }));
-    } catch (e) {
-        throw new Error("Connection failed. Check URL and API Key.");
-    }
+    } catch (e) { return []; }
 };
 
-// --- MEDIA FETCHERS ---
-export const getItems = async (type = 'Movie') => {
+export const getItems = async (type = 'Movie', sortBy = 'DateCreated', searchTerm = '') => {
+  const client = getClient();
+  if (!client) return [];
   try {
     const userId = await getUserId();
-    const res = await getClient().get(`/Users/${userId}/Items`, {
-      params: { 
-          IncludeItemTypes: type, 
-          Recursive: true, 
-          SortBy: 'DateCreated', 
-          SortOrder: 'Descending', 
-          Limit: 100, 
-          Fields: 'PrimaryImageAspectRatio,UserData,RunTimeTicks' 
-      }
-    });
-    return res.data.Items;
-  } catch (e) { console.error(e); return []; }
+    if (!userId) return [];
+    
+    const params = { 
+        IncludeItemTypes: type, 
+        Recursive: true, 
+        Limit: 100, 
+        Fields: 'PrimaryImageAspectRatio,UserData,RunTimeTicks,ChannelNumber',
+        // FIX 1: STRICT FILTERS FOR DOWNLOADED CONTENT
+        IsMissing: false,            // Ignore missing episodes/files
+        LocationTypes: 'FileSystem', // Only actual files on disk
+        ExcludeLocationTypes: 'Virtual',
+    };
+
+    // Sorting Logic
+    if (sortBy === 'Name') {
+        params.SortBy = 'SortName';
+        params.SortOrder = 'Ascending';
+    } else if (sortBy === 'DateCreated') {
+        params.SortBy = 'DateCreated';
+        params.SortOrder = 'Descending';
+    } else if (sortBy === 'PremiereDate') {
+        params.SortBy = 'PremiereDate';
+        params.SortOrder = 'Descending';
+    }
+
+    if (searchTerm) {
+        params.SearchTerm = searchTerm;
+    }
+
+    const res = await client.get(`/Users/${userId}/Items`, { params });
+    return res.data.Items || [];
+  } catch (e) { return []; }
 };
 
 export const getLiveTvChannels = async () => {
+    const client = getClient();
+    if (!client) return [];
     try {
         const userId = await getUserId();
-        const res = await getClient().get('/LiveTv/Channels', {
-            params: { UserId: userId, Limit: 2000, Fields: 'PrimaryImageAspectRatio,ChannelNumber', SortBy: 'ChannelNumber,SortName' }
+        if (!userId) return [];
+        const res = await client.get('/LiveTv/Channels', {
+            params: { 
+                UserId: userId, 
+                Limit: 2000, 
+                Fields: 'PrimaryImageAspectRatio,ChannelNumber', 
+                SortBy: 'ChannelNumber,SortName' 
+            }
         });
-        return res.data.Items; 
+        return res.data.Items || []; 
     } catch (e) { return []; }
 };
 
 export const getSeasons = async (seriesId) => {
-    const userId = await getUserId();
-    const res = await getClient().get(`/Shows/${seriesId}/Seasons`, { 
-        params: { UserId: userId, Fields: 'PrimaryImageAspectRatio,UserData' } 
-    });
-    return res.data.Items;
+    const client = getClient();
+    if (!client) return [];
+    try {
+        const userId = await getUserId();
+        const res = await client.get(`/Shows/${seriesId}/Seasons`, { 
+            params: { 
+                UserId: userId, 
+                Fields: 'PrimaryImageAspectRatio,UserData',
+                IsMissing: false // Ensure we don't show empty seasons
+            } 
+        });
+        return res.data.Items || [];
+    } catch (e) { return []; }
 };
 
 export const getEpisodes = async (seriesId, seasonId) => {
-    const userId = await getUserId();
-    const res = await getClient().get(`/Shows/${seriesId}/Episodes`, {
-        params: { UserId: userId, SeasonId: seasonId, Fields: 'PrimaryImageAspectRatio,IndexNumber,Overview,UserData,RunTimeTicks' }
-    });
-    return res.data.Items;
-};
-
-// --- REMOTE CONTROL ---
-const getTargetSession = async () => {
-    const { ANDROID_TV_ID } = getConfig();
-    const sessions = await getClient().get('/Sessions');
-    return sessions.data.find(s => 
-        (s.DeviceId === ANDROID_TV_ID || (s.DeviceName && s.DeviceName.includes(ANDROID_TV_ID)))
-    );
-};
-
-// --- UPDATED PLAY LOGIC (AUTO-STOP) ---
-export const playOnDevice = async (itemId) => {
-  if (!itemId) return;
-  try {
-    const session = await getTargetSession();
-    if (!session) { alert("Device not found! Go to Settings -> Scan."); return; }
-    
     const client = getClient();
+    if (!client) return [];
+    try {
+        const userId = await getUserId();
+        const res = await client.get(`/Shows/${seriesId}/Episodes`, {
+            params: { 
+                UserId: userId, 
+                SeasonId: seasonId, 
+                Fields: 'PrimaryImageAspectRatio,IndexNumber,Overview,UserData,RunTimeTicks',
+                IsMissing: false // Ensure we don't show missing episodes
+            }
+        });
+        return res.data.Items || [];
+    } catch (e) { return []; }
+};
 
-    // 1. If currently playing, STOP it first to clear the buffer
-    if (session.NowPlayingItem) {
-        await client.post(`/Sessions/${session.Id}/Playing/Stop`);
-        // 2. Wait 500ms for the TV to actually stop
-        await new Promise(r => setTimeout(r, 500));
-    }
+// FIX 2: ROBUST PLAYBACK COMMAND
+export const playOnDevice = async (itemId) => {
+  if (!itemId) throw new Error("No Item ID provided");
+  const client = getClient();
+  if (!client) throw new Error("API Client not ready");
 
-    // 3. Send Play Command
-    await client.post(`/Sessions/${session.Id}/Playing`, 
-      { ItemIds: [String(itemId)], PlayCommand: 'PlayNow' }, 
-      { params: { ItemIds: String(itemId), PlayCommand: 'PlayNow' } }
-    );
+  try {
+    const userId = await getUserId(); 
+    if (!userId) throw new Error("No valid user found to issue command.");
+
+    const { ANDROID_TV_ID } = getConfig();
+    if (!ANDROID_TV_ID) throw new Error("No Target Device set in settings.");
+
+    const sessions = await client.get('/Sessions');
+    const session = sessions.data.find(s => (s.DeviceId === ANDROID_TV_ID || (s.DeviceName && s.DeviceName.includes(ANDROID_TV_ID))));
     
+    if (!session) throw new Error(`Device "${ANDROID_TV_ID}" not found. Is it active?`);
+    if (!session.SupportsRemoteControl) throw new Error("Target device does not support remote control.");
+
+    // Issue Play Command
+    console.log(`Sending Play Command to ${session.Id} for Item ${itemId}`);
+    
+    // NOTE: Sending params in BOTH query and body covers all server versions
+    const queryParams = { 
+        ControllingUserId: userId,
+        PlayCommand: 'PlayNow',
+        ItemIds: String(itemId)
+    };
+
+    const bodyParams = {
+        ControllingUserId: userId,
+        PlayCommand: 'PlayNow',
+        ItemIds: [String(itemId)]
+    };
+    
+    await client.post(`/Sessions/${session.Id}/Playing`, bodyParams, { params: queryParams });
+
   } catch (err) { 
-      console.error(err);
-      alert("Play Failed: " + err.message); 
+      const status = err.response?.status;
+      const msg = err.response?.data || err.message;
+      console.error("Playback Error:", err);
+      throw new Error(`Error ${status}: ${JSON.stringify(msg)}`); 
   }
 };
 
 export const getSessionStatus = async () => {
     try {
-        const session = await getTargetSession();
+        const client = getClient();
+        if (!client) return null;
+        
+        const { ANDROID_TV_ID, JELLYFIN_URL } = getConfig();
+        const sessions = await client.get('/Sessions');
+        const session = sessions.data.find(s => (s.DeviceId === ANDROID_TV_ID || (s.DeviceName && s.DeviceName.includes(ANDROID_TV_ID))));
+        
         if (!session || !session.NowPlayingItem) return null;
-        const { JELLYFIN_URL } = getConfig();
+        
         const item = session.NowPlayingItem;
-
-        let quality = "HD";
-        if (item.Width >= 3000) quality = "4K";
-        else if (item.Width >= 1900) quality = "1080p";
-        else if (item.Width >= 1200) quality = "720p";
-        else if (item.Width < 1200) quality = "SD";
-
+        const cleanUrl = JELLYFIN_URL.endsWith('/') ? JELLYFIN_URL.slice(0, -1) : JELLYFIN_URL;
+        
         return {
-            sessionId: session.Id,
-            itemId: item.Id,
             title: item.Name,
-            seriesName: item.SeriesName || null,
-            season: item.ParentIndexNumber || null,
-            episode: item.IndexNumber || null,
-            quality: quality, 
-            image: item.PrimaryImageTag 
-                ? `${JELLYFIN_URL}/Items/${item.Id}/Images/Primary?tag=${item.PrimaryImageTag}` 
-                : null,
+            seriesName: item.SeriesName,
+            season: item.ParentIndexNumber,
+            episode: item.IndexNumber,
+            image: item.PrimaryImageTag ? `${cleanUrl}/Items/${item.Id}/Images/Primary?tag=${item.PrimaryImageTag}` : null,
             isPlaying: !session.PlayState.IsPaused,
             positionTicks: session.PlayState.PositionTicks,
-            durationTicks: item.RunTimeTicks
+            durationTicks: item.RunTimeTicks,
+            quality: item.Width >= 3000 ? "4K" : item.Width >= 1900 ? "1080p" : "SD"
         };
     } catch (e) { return null; }
 };
 
 export const sendControl = async (command, val = null) => {
+    const client = getClient();
+    if (!client) return;
     try {
-        const session = await getTargetSession();
+        const userId = await getUserId();
+        const { ANDROID_TV_ID } = getConfig();
+        const sessions = await client.get('/Sessions');
+        const session = sessions.data.find(s => (s.DeviceId === ANDROID_TV_ID || (s.DeviceName && s.DeviceName.includes(ANDROID_TV_ID))));
         if (!session) return;
-        const client = getClient();
-        let url = "";
 
+        let url = "";
+        const params = { ControllingUserId: userId };
+        
         switch (command) {
             case 'playpause': url = `/Sessions/${session.Id}/Playing/PlayPause`; break;
             case 'stop': url = `/Sessions/${session.Id}/Playing/Stop`; break;
             case 'next': url = `/Sessions/${session.Id}/Playing/NextTrack`; break;
             case 'prev': url = `/Sessions/${session.Id}/Playing/PreviousTrack`; break;
-            case 'seek': url = `/Sessions/${session.Id}/Playing/Seek?SeekPositionTicks=${val}`; break;
-            case 'volume': 
-                await client.post(`/Sessions/${session.Id}/Command/SetVolume`, { Arguments: { Volume: val } });
-                return; 
+            case 'seek': 
+                url = `/Sessions/${session.Id}/Playing/Seek`; 
+                params.SeekPositionTicks = val;
+                break;
         }
-        if (url) await client.post(url);
-    } catch (e) { console.error("Control Error", e); }
+        if (url) await client.post(url, null, { params });
+    } catch (e) { console.error(e); }
+};
+
+export const searchLocalLibrary = async (query) => {
+    const client = getClient();
+    if (!client) return [];
+    try {
+        const userId = await getUserId();
+        if (!userId) return [];
+
+        // Base Params - Ensure filtered to only valid files
+        const baseParams = {
+            IncludeItemTypes: 'Movie,Series',
+            Recursive: true,
+            IsMissing: false,
+            LocationTypes: 'FileSystem',
+            Limit: 50,
+            Fields: 'PrimaryImageAspectRatio,UserData,RunTimeTicks'
+        };
+
+        if (!query || query.trim() === "") {
+            const res = await client.get(`/Users/${userId}/Items`, {
+                params: { ...baseParams, SortBy: 'DateCreated', SortOrder: 'Descending' }
+            });
+            return res.data.Items || [];
+        }
+
+        const res = await client.get(`/Users/${userId}/Items`, {
+            params: { ...baseParams, SearchTerm: query }
+        });
+        return res.data.Items || [];
+    } catch (e) { 
+        console.error("Search Error:", e);
+        return []; 
+    }
 };
